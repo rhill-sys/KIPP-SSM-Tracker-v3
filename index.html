@@ -129,6 +129,20 @@
 </div>
 
 <div class="card" style="margin-bottom:20px">
+  <h2>Enrollment vs SSM — City Correlation</h2>
+  <div class="hint">Each dot = one city (SY 2024-25). X = enrollment proxy (ELA n_scores). Y = student-weighted SSM across ELA+Math. Dashed line = linear regression. Hover for city.</div>
+  <div class="chart-wrap tall"><canvas id="chart_corr"></canvas></div>
+  <div class="legend-note" id="corr_stats"></div>
+</div>
+
+<div class="card" style="margin-bottom:20px">
+  <h2>Enrollment vs SSM — CMO Correlation</h2>
+  <div class="hint">Each dot = one CMO (SY 2024-25). X = enrollment proxy (ELA n_scores). Y = avg SSM (ELA + Math) from the CMO-Level tab, with TEAM & Family recomputed. Dashed line = linear regression.</div>
+  <div class="chart-wrap tall"><canvas id="chart_corr_cmo"></canvas></div>
+  <div class="legend-note" id="corr_cmo_stats"></div>
+</div>
+
+<div class="card" style="margin-bottom:20px">
   <h2>Two-Year SSM Trend by CMO</h2>
   <div class="hint">Slope chart — 23-24 vs 24-25 for each CMO. Steep up = fast improvement.</div>
   <div class="chart-wrap tall"><canvas id="chart_slope"></canvas></div>
@@ -550,9 +564,177 @@ function renderCities() {
 }
 document.getElementById('city_min').addEventListener('input', renderCities);
 
+let chartCorr;
+function renderCorrelation() {
+  // Always uses SY 2024-25, respects state/cmo/subject filters
+  const rows = SCHOOLS.filter(r => r.school_year === '2024-2025'
+    && (ST.state==='ALL' || r.state_abbrev===ST.state)
+    && (ST.cmo==='ALL' || r.cmo_name===ST.cmo));
+  const byCity = {};
+  rows.forEach(r => {
+    if (!byCity[r.city]) byCity[r.city] = {ssm_num:0, ssm_den:0, enroll:0, schools:new Set()};
+    const b = byCity[r.city];
+    b.schools.add(r.state_school_id);
+    if (r.test_subject === 'ELA' && r.n_scores) b.enroll += r.n_scores;
+    if (r.SSM != null && (ST.subject==='ALL' || r.test_subject===ST.subject)) {
+      const w = r.n_scores != null ? r.n_scores : 1;
+      b.ssm_num += r.SSM*w; b.ssm_den += w;
+    }
+  });
+  const pts = [];
+  Object.entries(byCity).forEach(([city, b]) => {
+    if (b.ssm_den === 0 || b.enroll === 0) return;
+    pts.push({x: b.enroll, y: b.ssm_num/b.ssm_den, city, nschools: b.schools.size});
+  });
+  const n = pts.length;
+  let r = NaN, slope = 0, intercept = 0, minX = 0, maxX = 1;
+  if (n >= 2) {
+    const mx = pts.reduce((a,p)=>a+p.x,0)/n;
+    const my = pts.reduce((a,p)=>a+p.y,0)/n;
+    let num=0, dx=0, dy=0;
+    pts.forEach(p => { num += (p.x-mx)*(p.y-my); dx += (p.x-mx)**2; dy += (p.y-my)**2; });
+    r = num / Math.sqrt(dx*dy);
+    slope = num / dx;
+    intercept = my - slope*mx;
+    minX = Math.min(...pts.map(p=>p.x));
+    maxX = Math.max(...pts.map(p=>p.x));
+  }
+  const regLine = [
+    {x: minX, y: slope*minX + intercept},
+    {x: maxX, y: slope*maxX + intercept},
+  ];
+  const ctx = document.getElementById('chart_corr').getContext('2d');
+  if (chartCorr) chartCorr.destroy();
+  chartCorr = new Chart(ctx, {
+    type:'scatter',
+    data:{datasets:[
+      {
+        label:'Cities',
+        data: pts,
+        backgroundColor: pts.map(p => p.y>=50?'#22c55e':'#ef4444'),
+        borderColor: '#0f172a', borderWidth:1,
+        pointRadius: pts.map(p => Math.max(4, Math.min(12, Math.sqrt(p.nschools)*3))),
+        pointHoverRadius: 10,
+      },
+      {
+        label:'Linear regression', type:'line', data: regLine,
+        borderColor:'#38bdf8', borderWidth:2, borderDash:[6,6],
+        pointRadius:0, fill:false,
+      }
+    ]},
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{
+        legend:{labels:{color:'#94a3b8', boxWidth:12}},
+        tooltip:{callbacks:{label:c => {
+          if (c.dataset.label==='Linear regression') return null;
+          const p = c.raw;
+          return [`${p.city}`, `Enrollment: ${p.x.toLocaleString()}`, `SSM: ${fmt(p.y)}`, `${p.nschools} school${p.nschools===1?'':'s'}`];
+        }}}
+      },
+      scales:{
+        x:{type:'linear', title:{display:true,text:'Enrollment (ELA n_scores, SY 24-25)',color:'#94a3b8'}, grid:{color:'#334155'}, ticks:{color:'#94a3b8'}},
+        y:{beginAtZero:true, max:100, title:{display:true,text:'Weighted SSM',color:'#94a3b8'}, grid:{color:'#334155'}, ticks:{color:'#94a3b8'}}
+      }
+    }
+  });
+  const stats = document.getElementById('corr_stats');
+  if (isNaN(r)) { stats.textContent = 'Not enough cities for a correlation.'; return; }
+  const rsq = r*r;
+  const strength = Math.abs(r)<0.2?'very weak':Math.abs(r)<0.4?'weak':Math.abs(r)<0.6?'moderate':Math.abs(r)<0.8?'strong':'very strong';
+  const dir = r>=0?'positive':'negative';
+  stats.innerHTML = `<b>N = ${n} cities · Pearson r = ${r.toFixed(3)} · r² = ${rsq.toFixed(3)}</b> — ${strength} ${dir} correlation. Regression: SSM ≈ ${intercept.toFixed(1)} + ${slope.toFixed(4)} × enrollment. Only ${(rsq*100).toFixed(1)}% of SSM variance is explained by city enrollment size. Dot size ∝ √(# schools in city).`;
+}
+
+let chartCorrCmo;
+function renderCorrelationCmo() {
+  // Enrollment = sum of ELA n_scores per CMO for 24-25
+  const enroll = {};
+  SCHOOLS.forEach(r => {
+    if (r.school_year !== '2024-2025') return;
+    if (r.test_subject !== 'ELA' || !r.n_scores) return;
+    if (ST.state!=='ALL' && r.state_abbrev!==ST.state) return;
+    if (ST.cmo!=='ALL' && r.cmo_name!==ST.cmo) return;
+    enroll[r.cmo_name] = (enroll[r.cmo_name]||0) + r.n_scores;
+  });
+  // CMO SSM from CMOS tab, respect subject filter
+  const byCmo = {};
+  CMOS.forEach(r => {
+    if (r.school_year !== '2024-2025') return;
+    if (r.SSM == null) return;
+    if (ST.subject!=='ALL' && r.test_subject!==ST.subject) return;
+    if (!byCmo[r.cmo_name]) byCmo[r.cmo_name] = [];
+    byCmo[r.cmo_name].push(r.SSM);
+  });
+  const pts = [];
+  Object.entries(byCmo).forEach(([cmo, ssms]) => {
+    const e = enroll[cmo] || 0;
+    if (!e) return;
+    const ssm = ssms.reduce((a,b)=>a+b,0)/ssms.length;
+    pts.push({x: e, y: ssm, cmo});
+  });
+  const n = pts.length;
+  let r = NaN, slope = 0, intercept = 0, minX = 0, maxX = 1;
+  if (n >= 2) {
+    const mx = pts.reduce((a,p)=>a+p.x,0)/n;
+    const my = pts.reduce((a,p)=>a+p.y,0)/n;
+    let num=0, dx=0, dy=0;
+    pts.forEach(p => { num += (p.x-mx)*(p.y-my); dx += (p.x-mx)**2; dy += (p.y-my)**2; });
+    r = num / Math.sqrt(dx*dy);
+    slope = num / dx;
+    intercept = my - slope*mx;
+    minX = Math.min(...pts.map(p=>p.x));
+    maxX = Math.max(...pts.map(p=>p.x));
+  }
+  const regLine = [
+    {x: minX, y: slope*minX + intercept},
+    {x: maxX, y: slope*maxX + intercept},
+  ];
+  const ctx = document.getElementById('chart_corr_cmo').getContext('2d');
+  if (chartCorrCmo) chartCorrCmo.destroy();
+  chartCorrCmo = new Chart(ctx, {
+    type:'scatter',
+    data:{datasets:[
+      {
+        label:'CMOs',
+        data: pts,
+        backgroundColor: pts.map(p => p.y>=50?'#22c55e':'#ef4444'),
+        borderColor: '#0f172a', borderWidth:1,
+        pointRadius:6, pointHoverRadius:10,
+      },
+      {
+        label:'Linear regression', type:'line', data: regLine,
+        borderColor:'#a78bfa', borderWidth:2, borderDash:[6,6],
+        pointRadius:0, fill:false,
+      }
+    ]},
+    options:{
+      responsive:true, maintainAspectRatio:false,
+      plugins:{
+        legend:{labels:{color:'#94a3b8', boxWidth:12}},
+        tooltip:{callbacks:{label:c => {
+          if (c.dataset.label==='Linear regression') return null;
+          const p = c.raw;
+          return [`${p.cmo}`, `Enrollment: ${p.x.toLocaleString()}`, `SSM: ${fmt(p.y)}`];
+        }}}
+      },
+      scales:{
+        x:{type:'linear', title:{display:true,text:'Enrollment (ELA n_scores, SY 24-25)',color:'#94a3b8'}, grid:{color:'#334155'}, ticks:{color:'#94a3b8'}},
+        y:{beginAtZero:true, max:100, title:{display:true,text:'CMO SSM',color:'#94a3b8'}, grid:{color:'#334155'}, ticks:{color:'#94a3b8'}}
+      }
+    }
+  });
+  const stats = document.getElementById('corr_cmo_stats');
+  if (isNaN(r)) { stats.textContent = 'Not enough CMOs for a correlation.'; return; }
+  const rsq = r*r;
+  const strength = Math.abs(r)<0.2?'very weak':Math.abs(r)<0.4?'weak':Math.abs(r)<0.6?'moderate':Math.abs(r)<0.8?'strong':'very strong';
+  const dir = r>=0?'positive':'negative';
+  stats.innerHTML = `<b>N = ${n} CMOs · Pearson r = ${r.toFixed(3)} · r² = ${rsq.toFixed(3)}</b> — ${strength} ${dir} correlation. Regression: SSM ≈ ${intercept.toFixed(1)} + ${slope.toFixed(4)} × enrollment. Only ${(rsq*100).toFixed(1)}% of SSM variance is explained by CMO size. CMOs with no reported n_scores (Columbus, Chicago, Delta) are excluded.`;
+}
+
 function renderAll() {
   renderKpis(); renderLeaderboard(); renderYoy();
-  renderDist(); renderStates(); renderCities(); renderSlope(); renderTable();
+  renderDist(); renderStates(); renderCities(); renderCorrelation(); renderCorrelationCmo(); renderSlope(); renderTable();
 }
 ['f_subject','f_year','f_state','f_cmo'].forEach(id => {
   document.getElementById(id).addEventListener('change', e => {
